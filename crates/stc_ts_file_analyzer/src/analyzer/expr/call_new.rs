@@ -2340,10 +2340,28 @@ impl Analyzer<'_, '_> {
         min_param: usize,
     ) -> VResult<()> {
         let mut real_idx = 0;
+        // TODO: should be checking that the rest param is an array but this is
+        // resulting in more bugs atm
         let has_rest_param = !params.is_empty() && matches!(params[params.len() - 1].pat, RPat::Rest(_));
-        // non required params can be pushed into
-        let no_longer_required = |index: usize| !params.is_empty() && index < params.len() && !params[index].required;
 
+        fn no_longer_required(index: usize, params: &[FnParam]) -> bool {
+            let mut param_idx = 0;
+            for param in params.iter() {
+                if matches!(param.pat, RPat::Rest(_)) {
+                    match param.ty.normalize() {
+                        Type::Tuple(tup) => param_idx += tup.elems.len(),
+                        _ => param_idx += 1, // This is wrong
+                    };
+                } else {
+                    param_idx += 1;
+                }
+
+                if index < param_idx {
+                    return !param.required;
+                }
+            }
+            false
+        }
         for arg_type in arg_types.iter() {
             let is_spread = arg_type.spread.is_some();
             if !is_spread {
@@ -2352,15 +2370,67 @@ impl Analyzer<'_, '_> {
             }
             match arg_type.ty.normalize() {
                 Type::Tuple(tuple) => real_idx += tuple.elems.len(),
-                _ => {
+                Type::Array(_) => {
                     // rest params are always at the end so we can check if it
                     // was passed at least at the end and their must be a rest param
-                    if (real_idx < min_param || !has_rest_param) && !no_longer_required(real_idx) {
+                    if (real_idx < min_param || !has_rest_param) && !no_longer_required(real_idx, params) {
                         return Err(ErrorKind::SpreadMustBeTupleOrPassedToRest { span: arg_type.span }.into());
                     }
                     real_idx += 1
                 }
+                _ => real_idx += 1,
             }
+        }
+        if has_rest_param {
+            return Ok(());
+        }
+        // TODO: this implementation is almost certainly wrong
+        fn count_max_param(p: &RPat) -> usize {
+            match p {
+                RPat::Rest(p) => {
+                    if p.type_ann.is_some() {
+                        return 0;
+                    }
+
+                    match &*p.arg {
+                        RPat::Array(arr) => arr
+                            .elems
+                            .iter()
+                            .map(|v| {
+                                v.as_ref()
+                                    .map(|pat| match pat {
+                                        RPat::Array(_) => 1,
+                                        RPat::Object(_) => 1,
+
+                                        RPat::Ident(..) => 0,
+
+                                        _ => 0,
+                                    })
+                                    .unwrap_or(1)
+                            })
+                            .sum(),
+                        _ => 0,
+                    }
+                }
+                RPat::Ident(RBindingIdent {
+                    id: RIdent { sym: js_word!("this"), .. },
+                    ..
+                }) => 0,
+                RPat::Ident(v) => 1,
+                RPat::Array(v) => 1,
+                RPat::Object(v) => 1,
+                RPat::Assign(..) | RPat::Invalid(_) | RPat::Expr(_) => 0,
+            }
+        }
+        let max_params: usize = params.iter().map(|v| &v.pat).map(count_max_param).sum();
+        if max_params < real_idx {
+            // TODO: wrong span
+            return Err(ErrorKind::ExpectedNArgsButGotM {
+                span: arg_types[arg_types.len() - 1].span,
+                min: min_param,
+                max: Some(max_params),
+            }
+            .into());
         }
         Ok(())
     }
